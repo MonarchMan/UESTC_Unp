@@ -92,3 +92,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
 5. **服务端传输参数**：必须设置 `params.original_dcid_present = 1` 和 `params.original_dcid = dcid`，否则 ngtcp2 断言失败
 
 6. **ngtcp2 v1.22 新增回调**：`update_key` 和 `get_path_challenge_data2` 回调必须设置，否则连接创建失败
+
+7. **`on_packet()` 后必须调用 `schedule_timer()`**：`ngtcp2_conn_read_pkt` 可能设置丢包检测定时器（如 PTO），若不立即重新调度，旧定时器超时值继续生效，重传永远不触发，丢包后连接卡死。这是 ngtcp2 示例的标准模式。
+
+8. **定时器延迟不能为 0**：`ngtcp2_conn_get_expiry` 可能返回已过期的时间戳，计算得 `delay=0`。0-delay 的 `steady_timer` 在 `io.poll()` 循环中每次都被视为就绪，不断触发→重装→再触发，导致接收处理器被饿死。加 100us 下限即可解决。

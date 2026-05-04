@@ -236,6 +236,7 @@ void QuicSession::schedule_timer() {
     auto expiry = ngtcp2_conn_get_expiry(conn_);
     auto now = timestamp_ns();
     auto delay = (expiry > now) ? (expiry - now) : 0;
+    if (delay == 0) delay = 100000ULL; // floor at 100us to avoid starving rx handlers
 
     timer_.expires_after(std::chrono::nanoseconds(delay));
     auto self = shared_from_this();
@@ -277,6 +278,7 @@ void QuicSession::on_packet(const uint8_t* data, size_t len,
     }
 
     write_and_send_packets();
+    schedule_timer();
 }
 
 int QuicSession::write_and_send_packets() {

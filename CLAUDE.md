@@ -112,13 +112,18 @@ Dependencies (system packages):
 cd /root/unp && ./build/quic_tests
 ```
 
-All 12 tests pass.
+All 18 tests pass.
 
 ### Key ngtcp2 v1.22.90 gotchas
 
 - **`ngtcp2_conn_set_tls_native_handle(conn, session)` is mandatory** after
   `ngtcp2_conn_{client,server}_new`. Without it, `ngtcp2_conn_get_tls_native_handle`
   returns null and the crypto callbacks crash.
+- **`schedule_timer()` must be called after `on_packet()`** — `ngtcp2_conn_read_pkt`
+  may arm the loss detection timer; without re-scheduling, retransmissions never fire
+  and the connection stalls when packets are lost.
+- **Timer delay must have a floor (~100us)** — a 0-delay timer causes `io.poll()` loops
+  to starve receive handlers (timer always ready, constantly re-arms).
 - **`ngtcp2_path_storage_init` deep-copies addresses** into an internal buffer.
   Local/stack addresses are safe to pass — they're copied immediately.
 - **Server `original_dcid_present`**: Server transport params MUST set
@@ -144,7 +149,7 @@ src/quic_client.hpp/cpp    — UDP socket + QuicSession (client side)
 src/quic_server.hpp/cpp    — UDP socket + session map (server side)
 src/main_client.cpp        — client entry point
 src/main_server.cpp        — server entry point
-tests/test_quic.cpp        — Google Test suite (12 tests)
+tests/test_quic.cpp        — Google Test suite (18 tests)
 certs/cert.pem, key.pem    — self-signed X.509 for testing
 docs/design.md             — architecture and design decisions
 docs/implementation.md     — step-by-step implementation guide

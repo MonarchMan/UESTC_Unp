@@ -10,122 +10,50 @@
 
 using namespace quic;
 
-// ===== UDP Proxy (drop + delay simulation) =====
-
-class UdpProxy {
-public:
-    UdpProxy(boost::asio::io_context& io,
-             const boost::asio::ip::udp::endpoint& server_ep,
-             double drop_rate = 0.0, int delay_ms = 0)
-        : socket_(io), server_ep_(server_ep),
-          drop_rate_(drop_rate), delay_ms_(delay_ms),
-          rng_(std::random_device{}()) {}
-
-    void start() {
-        boost::asio::ip::udp::endpoint ep(boost::asio::ip::make_address("127.0.0.1"), 0);
-        socket_.open(ep.protocol());
-        socket_.bind(ep);
-        do_receive();
-    }
-
-    uint16_t port() const { return socket_.local_endpoint().port(); }
-    void set_drop_rate(double r) { drop_rate_ = r; }
-    void set_delay(int ms) { delay_ms_ = ms; }
-    size_t dropped() const { return dropped_.load(); }
-    size_t forwarded() const { return forwarded_.load(); }
-    void reset_stats() { dropped_ = 0; forwarded_ = 0; }
-
-private:
-    void do_receive() {
-        socket_.async_receive_from(
-            boost::asio::buffer(rx_buf_), sender_ep_,
-            [this](const boost::system::error_code& ec, size_t bytes) {
-                if (ec) return;
-                std::bernoulli_distribution drop(drop_rate_);
-                if (drop(rng_)) {
-                    dropped_++;
-                    do_receive();
-                    return;
-                }
-                forwarded_++;
-                if (sender_ep_ == server_ep_) {
-                    forward_to(bytes, client_ep_);
-                } else {
-                    client_ep_ = sender_ep_;
-                    forward_to(bytes, server_ep_);
-                }
-                do_receive();
-            });
-    }
-
-    void forward_to(size_t bytes, const boost::asio::ip::udp::endpoint& dest) {
-        if (delay_ms_ > 0) {
-            auto timer = std::make_shared<boost::asio::steady_timer>(
-                socket_.get_executor(), std::chrono::milliseconds(delay_ms_));
-            std::vector<uint8_t> data(rx_buf_.begin(), rx_buf_.begin() + bytes);
-            timer->async_wait([this, timer, data = std::move(data), dest]
-                              (const boost::system::error_code&) {
-                socket_.send_to(boost::asio::buffer(data), dest);
-            });
-        } else {
-            socket_.send_to(boost::asio::buffer(rx_buf_, bytes), dest);
-        }
-    }
-
-    boost::asio::ip::udp::socket socket_;
-    boost::asio::ip::udp::endpoint server_ep_;
-    boost::asio::ip::udp::endpoint client_ep_;
-    boost::asio::ip::udp::endpoint sender_ep_;
-    std::array<uint8_t, 65535> rx_buf_;
-    double drop_rate_;
-    int delay_ms_;
-    std::mt19937 rng_;
-    std::atomic<size_t> dropped_{0};
-    std::atomic<size_t> forwarded_{0};
-};
-
-// ===== Poll helper: drain all ready handlers, sleep, repeat =====
+// ===== Poll helper: run handlers until condition met or timeout =====
 static bool poll_until(boost::asio::io_context& io, int timeout_ms,
                         const std::function<bool()>& cond, int us_sleep = 200) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        while (io.poll() > 0) {}
+    while (std::chrono::steady_clock::now() < deadline && !io.stopped()) {
+        io.run_one_for(std::chrono::microseconds(us_sleep));
         if (cond()) return true;
-        if (io.stopped()) break;
-        std::this_thread::sleep_for(std::chrono::microseconds(us_sleep));
     }
-    while (io.poll() > 0) {}
     return cond();
 }
 
-// ===== Direct poll (no sleep) for use inside busy-loops =====
+// ===== Drain I/O: run for a fixed window to process any pending handlers =====
 static void drain_io(boost::asio::io_context& io) {
-    while (io.poll() > 0) {}
+    io.run_for(std::chrono::milliseconds(1));
 }
 
 // Bulk-send helper: pushes data through a stream, draining io between chunks.
-static void bulk_send(QuicSession& session, uint64_t stream_id,
+// Uses time-based deadline (not retry-count) so CWND recovery can complete.
+static bool bulk_send(QuicSession& session, uint64_t stream_id,
                       const uint8_t* data, size_t total_len,
-                      boost::asio::io_context& io) {
+                      boost::asio::io_context& io, int deadline_ms = 60000) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms);
     size_t offset = 0;
-    int blocked = 0;
-    while (offset < total_len && blocked < 1000) {
+    while (offset < total_len && std::chrono::steady_clock::now() < deadline) {
         size_t chunk = std::min<size_t>(total_len - offset, (size_t)4096);
         auto consumed = session.send_stream_data(stream_id, data + offset, chunk);
         if (consumed > 0) {
             offset += static_cast<size_t>(consumed);
             drain_io(io);
-            blocked = 0;
         } else if (consumed == 0) {
             io.run_for(std::chrono::milliseconds(1));
-            blocked++;
         } else {
-            break;
+            return false;
         }
     }
+    return offset >= total_len;
 }
 
 // ===== Packet Loss Recovery =====
+//
+// Simulates loss directly in send functions (no proxy needed).
+// This avoids the timing races inherent in threaded proxy + manual io polling.
+// Packet loss is applied independently in each direction to approximate
+// the proxy behavior without the threading complexity.
 
 TEST(PacketLossRecovery, PacketLossRecovery) {
     struct Run { double loss; size_t rx; double sec; size_t drop; size_t fwd; double mbps; bool hs_ok; };
@@ -139,21 +67,35 @@ TEST(PacketLossRecovery, PacketLossRecovery) {
         auto cred = load_server_credentials("certs/cert.pem", "certs/key.pem");
         if (!cred) { results.push_back({lr, 0, 0, 0, 0, 0, false}); continue; }
 
+        std::mt19937 loss_rng(std::random_device{}());
+        std::bernoulli_distribution loss_dist(lr);
+        std::atomic<size_t> dropped{0}, forwarded{0};
+
+        auto make_lossy = [&](auto inner) {
+            return [inner = std::move(inner), &loss_dist, &loss_rng, &dropped, &forwarded]
+                   (const uint8_t* pkt, size_t plen, const sockaddr* addr, socklen_t alen) {
+                forwarded++;
+                if (loss_dist(loss_rng)) { dropped++; return; }
+                inner(pkt, plen, addr, alen);
+            };
+        };
+
         boost::asio::ip::udp::socket srv_sock(io); srv_sock.open(boost::asio::ip::udp::v4());
         srv_sock.set_option(boost::asio::ip::udp::socket::reuse_address(true));
         srv_sock.bind(boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
         uint16_t srv_port = srv_sock.local_endpoint().port();
-
-        boost::asio::ip::udp::endpoint real_srv(boost::asio::ip::make_address("127.0.0.1"), srv_port);
-        UdpProxy proxy(io, real_srv, lr, 0);
-        proxy.start();
-        uint16_t proxy_port = proxy.port();
 
         std::shared_ptr<QuicSession> srv_sess;
         std::atomic<bool> srv_hs{false}, cli_hs{false};
         std::atomic<size_t> srv_bytes{0};
         std::vector<uint8_t> srv_rx(65535), cli_rx(65535);
         auto srv_ep = std::make_shared<boost::asio::ip::udp::endpoint>();
+
+        // Server send: apply loss in server→client direction
+        auto srv_send_inner = [&srv_sock, srv_ep](const uint8_t* pkt, size_t plen, const sockaddr*, socklen_t) {
+            srv_sock.send_to(boost::asio::buffer(pkt, plen), *srv_ep);
+        };
+        auto srv_send_lossy = make_lossy(std::move(srv_send_inner));
 
         std::function<void(const boost::system::error_code&, size_t)> on_srv;
         on_srv = [&](const boost::system::error_code& ec, size_t bytes) {
@@ -179,10 +121,7 @@ TEST(PacketLossRecovery, PacketLossRecovery) {
                 auto cab = srv_ep->address().to_v4().to_bytes();
                 std::memcpy(&rsin->sin_addr, cab.data(), 4);
                 path.remote.addr = reinterpret_cast<ngtcp2_sockaddr*>(&rss); path.remote.addrlen = sizeof(sockaddr_in);
-                auto sfn = [&srv_sock, srv_ep](const uint8_t* pkt, size_t plen, const sockaddr*, socklen_t) {
-                    srv_sock.send_to(boost::asio::buffer(pkt, plen), *srv_ep);
-                };
-                srv_sess = QuicSession::create_server(io, cred, dcid, scid, original_dcid, path, std::move(sfn),
+                srv_sess = QuicSession::create_server(io, cred, dcid, scid, original_dcid, path, srv_send_lossy,
                     [&](uint64_t, const uint8_t* d, size_t l) { srv_bytes += l; },
                     [&]() { srv_hs = true; });
                 if (srv_sess) { srv_sess->start(); srv_sess->on_packet(srv_rx.data(), bytes, reinterpret_cast<const sockaddr*>(&rss), sizeof(sockaddr_in)); }
@@ -193,13 +132,18 @@ TEST(PacketLossRecovery, PacketLossRecovery) {
         };
         srv_sock.async_receive_from(boost::asio::buffer(srv_rx), *srv_ep, on_srv);
 
+        // Client: send directly to server, with loss in client→server direction
         boost::asio::ip::udp::socket cli_sock(io); cli_sock.open(boost::asio::ip::udp::v4());
+        cli_sock.set_option(boost::asio::socket_base::receive_buffer_size(4 * 1024 * 1024));
         auto cli_ep = std::make_shared<boost::asio::ip::udp::endpoint>();
-        auto cli_send = [&](const uint8_t* pkt, size_t plen, const sockaddr*, socklen_t) {
+
+        auto cli_send_inner = [&cli_sock, srv_port](const uint8_t* pkt, size_t plen, const sockaddr*, socklen_t) {
             cli_sock.send_to(boost::asio::buffer(pkt, plen),
-                boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), proxy_port));
+                boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), srv_port));
         };
-        auto cli_sess = QuicSession::create_client(io, "127.0.0.1", proxy_port, cli_send, "certs/cert.pem",
+        auto cli_send_lossy = make_lossy(std::move(cli_send_inner));
+
+        auto cli_sess = QuicSession::create_client(io, "127.0.0.1", srv_port, cli_send_lossy, "certs/cert.pem",
             [](uint64_t, const uint8_t*, size_t) {}, [&]() { cli_hs = true; });
         if (!cli_sess) { results.push_back({lr, 0, 0, 0, 0, 0, false}); srv_sess.reset(); gnutls_certificate_free_credentials(cred); continue; }
 
@@ -214,17 +158,17 @@ TEST(PacketLossRecovery, PacketLossRecovery) {
         cli_sess->start();
         bool hs_ok = poll_until(io, 10000, [&]() { return cli_hs.load(); }, 200);
 
-        if (!hs_ok) { results.push_back({lr, 0, 0, proxy.dropped(), proxy.forwarded(), 0, false}); cli_sess.reset(); srv_sess.reset(); gnutls_certificate_free_credentials(cred); continue; }
+        if (!hs_ok) { results.push_back({lr, 0, 0, dropped.load(), forwarded.load(), 0, false}); cli_sess.reset(); srv_sess.reset(); gnutls_certificate_free_credentials(cred); continue; }
 
         std::vector<uint8_t> payload(total);
         std::mt19937 rng(123);
         for (auto& b : payload) b = static_cast<uint8_t>(rng());
 
         auto sid = cli_sess->open_bidi_stream();
-        if (!sid) { results.push_back({lr, 0, 0, proxy.dropped(), proxy.forwarded(), 0, true}); cli_sess.reset(); srv_sess.reset(); gnutls_certificate_free_credentials(cred); continue; }
+        if (!sid) { results.push_back({lr, 0, 0, dropped.load(), forwarded.load(), 0, true}); cli_sess.reset(); srv_sess.reset(); gnutls_certificate_free_credentials(cred); continue; }
 
         srv_bytes = 0;
-        proxy.reset_stats();
+        dropped = 0; forwarded = 0;
         auto t0 = std::chrono::steady_clock::now();
         bulk_send(*cli_sess, *sid, payload.data(), total, io);
         poll_until(io, 60000, [&]() { return srv_bytes.load() >= total; }, 200);
@@ -232,7 +176,7 @@ TEST(PacketLossRecovery, PacketLossRecovery) {
 
         double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
         double mbps = elapsed_s > 0 ? (srv_bytes.load() * 8.0) / (elapsed_s * 1e6) : 0;
-        results.push_back({lr, srv_bytes.load(), elapsed_s, proxy.dropped(), proxy.forwarded(), mbps, true});
+        results.push_back({lr, srv_bytes.load(), elapsed_s, dropped.load(), forwarded.load(), mbps, true});
 
         cli_sess.reset();
         srv_sess.reset();

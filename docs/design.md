@@ -38,7 +38,7 @@ boost::asio::io_context → async_receive_from (UDP收包)
 ```
 
 - **UDP 收包**：`socket.async_receive_from(...)` 在收到数据后回调，完成后再次投递下一次接收
-- **重传定时器**：`steady_timer.async_wait(...)` 根据 `ngtcp2_conn_get_expiry()` 设置超时，触发 `ngtcp2_conn_handle_expiry()` 后重新调度
+- **重传定时器**：`steady_timer.async_wait(...)` 根据 `ngtcp2_conn_get_expiry()` 设置超时（最小延迟 100us，防 0-delay 饥饿），触发 `ngtcp2_conn_handle_expiry()` 后重新调度。**关键：`on_packet()` 处理后也必须调用 `schedule_timer()`**，因为 `ngtcp2_conn_read_pkt` 可能设置新的丢包检测定时器。
 - **UDP 发包**：通过构造时注入的 `send_fn` lambda 完成，lambda 持有 owner socket 的引用
 
 ## 3. TLS 集成
@@ -86,6 +86,7 @@ UDP socket → async_receive_from → do_receive callback
                 → cb_handshake_completed    // 握手完成回调
                 → cb_recv_stream_data       // 应用数据回调
             → write_and_send_packets()      // 发送ACK等响应
+            → schedule_timer()              // 重装定时器（read_pkt 可能改了 expiry）
 ```
 
 ## 5. 并发模型
